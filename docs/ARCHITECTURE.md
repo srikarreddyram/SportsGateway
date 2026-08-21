@@ -36,15 +36,15 @@ returns, and a separate worker batches into MongoDB (ADR 0004).
 
 ## Where each guarantee lives
 
-| Guarantee | Enforced by | Shared across replicas? |
-|---|---|---|
-| Cached responses | `src/cache/index.js` + Redis | Yes — a MISS on one replica is a HIT on the next |
-| No cache stampede | Single-flight lock in Redis | Yes |
-| Per-client fairness | `src/ratelimit/inbound.js` | Yes — one budget, not one per replica |
-| Provider quota safety | `src/ratelimit/outbound.js` | Yes |
-| Fail fast on a bad provider | `src/upstream/breaker.js` | **No** — deliberately per-instance (ADR 0003) |
-| Graceful degradation | `src/routes/proxy.js` fallback path | Follows the cache, so yes |
-| Request analytics | BullMQ queue → worker → MongoDB | Yes |
+| Guarantee                   | Enforced by                         | Shared across replicas?                          |
+| --------------------------- | ----------------------------------- | ------------------------------------------------ |
+| Cached responses            | `src/cache/index.js` + Redis        | Yes — a MISS on one replica is a HIT on the next |
+| No cache stampede           | Single-flight lock in Redis         | Yes                                              |
+| Per-client fairness         | `src/ratelimit/inbound.js`          | Yes — one budget, not one per replica            |
+| Provider quota safety       | `src/ratelimit/outbound.js`         | Yes                                              |
+| Fail fast on a bad provider | `src/upstream/breaker.js`           | **No** — deliberately per-instance (ADR 0003)    |
+| Graceful degradation        | `src/routes/proxy.js` fallback path | Follows the cache, so yes                        |
+| Request analytics           | BullMQ queue → worker → MongoDB     | Yes                                              |
 
 The one deliberate exception is the circuit breaker. Everything else is shared state in
 Redis, which is what makes replicas interchangeable and the gateway horizontally scalable.
@@ -81,14 +81,14 @@ outage.
 
 ## Failure behaviour
 
-| Failure | What happens | Client sees |
-|---|---|---|
-| Provider slow | Breaker timeout, then fallback to cache | Cached data, `X-Degraded: true` |
+| Failure           | What happens                                 | Client sees                                 |
+| ----------------- | -------------------------------------------- | ------------------------------------------- |
+| Provider slow     | Breaker timeout, then fallback to cache      | Cached data, `X-Degraded: true`             |
 | Provider erroring | Breaker opens after threshold, stops calling | Cached data, or typed 503 if nothing cached |
-| Provider recovers | Half-open probe succeeds, breaker closes | Fresh data resumes automatically |
-| Redis down | Cache misses; rate limiters **fail open** | Slower responses, still served (ADR 0002) |
-| MongoDB down | Analytics events queue up | Nothing — logging is off the response path |
-| A replica dies | Nginx `max_fails` routes around it | Nothing — other replicas serve |
+| Provider recovers | Half-open probe succeeds, breaker closes     | Fresh data resumes automatically            |
+| Redis down        | Cache misses; rate limiters **fail open**    | Slower responses, still served (ADR 0002)   |
+| MongoDB down      | Analytics events queue up                    | Nothing — logging is off the response path  |
+| A replica dies    | Nginx `max_fails` routes around it           | Nothing — other replicas serve              |
 
 The consistent principle: degrade the non-essential before failing the request. Analytics
 loss, rate-limit enforcement and data freshness are all sacrificed before a client gets an

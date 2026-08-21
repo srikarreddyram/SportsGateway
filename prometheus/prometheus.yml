@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    stack: sportsgateway
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  # Gateway replicas are discovered by DNS rather than listed: Docker's embedded DNS
+  # returns an A record per replica, so `--scale gateway=3` is picked up automatically.
+  - job_name: gateway
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ['gateway']
+        type: A
+        port: 3000
+        refresh_interval: 10s
+
+  # Redis has no built-in /metrics; redis_exporter translates INFO output into one.
+  # Everything cached, both rate limiters, and every stampede lock live in this Redis,
+  # so its own health was previously invisible to Prometheus — only the gateway's view
+  # of it (cache hit/miss counters) was.
+  - job_name: redis
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+test
+k6
+results
+grafana
+prometheus
+nginx
+scripts
+*.md

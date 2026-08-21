@@ -1,0 +1,13 @@
+extends:
+  - recommended
+
+rules:
+  # This project ships as a self-hosted stack you run locally or on your own host; there
+  # is no public hosted instance to point at, so localhost servers are the honest answer
+  # rather than a placeholder domain that would resolve for nobody.
+  no-server-example.com: off
+
+  # /health, /ready and /metrics genuinely have no 4xx path: they take no parameters and
+  # no auth, so there is no client mistake for them to reject. Declaring an invented 400
+  # to satisfy a linter would make the contract less accurate, not more.
+  operation-4xx-response: off

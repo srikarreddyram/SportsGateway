@@ -1,0 +1,13 @@
+node_modules
+web/node_modules
+web/dist
+coverage
+results/*.json
+package-lock.json
+web/package-lock.json
+
+# Prose, not code — hand-formatted (tables, deliberate emphasis) and out of scope for an
+# automated formatter pass. Markdown inside docs/adr/ is short and structured enough that
+# Prettier's reflow is harmless there, so only the long-form documents are excluded.
+*.md
+!docs/**/*.md

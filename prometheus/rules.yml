@@ -1,0 +1,102 @@
+# Recording rules pre-compute the expressions the dashboard would otherwise recalculate
+# on every panel refresh — cheaper at query time, and the canonical names below are what
+# the Grafana dashboard reads instead of repeating the raw PromQL in five different panels.
+#
+# Alerting rules have no Alertmanager wired up in this stack (out of scope for a
+# single-host demo per the PRD), so a firing alert is not routed anywhere — it just
+# becomes visible at /alerts and in Grafana's alert list, which is enough to demonstrate
+# that the thresholds are real and evaluated, not just aspirational dashboard colors.
+groups:
+  - name: sportsgateway.recording
+    interval: 5s
+    rules:
+      - record: gateway:http_requests:rate1m
+        expr: sum by (route) (rate(gateway_http_requests_total[1m]))
+
+      # `or vector(0)` matters here, not just style: dividing two rate() vectors in
+      # PromQL returns *no data*, not 0, whenever the numerator's selector matches zero
+      # series — e.g. zero 5xx responses, or (during a cache-disabled baseline run) zero
+      # HIT/STALE/COALESCED events because every request is BYPASS. Without the
+      # fallback, "0% errors" and "no data" render identically in Grafana, which quietly
+      # defeats the point of putting a number on the dashboard at all.
+      - record: gateway:cache_hit_ratio:ratio1m
+        expr: >
+          (
+            sum(rate(gateway_cache_events_total{status=~"HIT|STALE|COALESCED"}[1m]))
+            / clamp_min(sum(rate(gateway_cache_events_total[1m])), 0.0001)
+          ) or vector(0)
+
+      - record: gateway:error_ratio:ratio1m
+        expr: >
+          (
+            sum(rate(gateway_http_requests_total{status=~"5.."}[1m]))
+            / clamp_min(sum(rate(gateway_http_requests_total[1m])), 0.0001)
+          ) or vector(0)
+
+      - record: gateway:http_request_duration_seconds:p50
+        expr: histogram_quantile(0.50, sum by (le) (rate(gateway_http_request_duration_seconds_bucket[1m])))
+
+      - record: gateway:http_request_duration_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(gateway_http_request_duration_seconds_bucket[1m])))
+
+      - record: gateway:http_request_duration_seconds:p99
+        expr: histogram_quantile(0.99, sum by (le) (rate(gateway_http_request_duration_seconds_bucket[1m])))
+
+      - record: gateway:upstream_requests:rate1m
+        expr: sum(rate(gateway_upstream_requests_total[1m]))
+
+  - name: sportsgateway.alerts
+    rules:
+      - alert: GatewayInstanceDown
+        expr: up{job="gateway"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Gateway instance {{ $labels.instance }} is unreachable'
+          description: 'Prometheus has failed to scrape {{ $labels.instance }} for 30s. Nginx should already be routing around it via max_fails.'
+
+      - alert: CircuitBreakerOpen
+        expr: max(gateway_circuit_breaker_state) == 2
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Circuit breaker is open'
+          description: 'The gateway has stopped calling upstream and is serving cached or fallback data instead.'
+
+      - alert: HighErrorRate
+        expr: gateway:error_ratio:ratio1m > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: '5xx rate above 5%'
+          description: '{{ $value | humanizePercentage }} of requests are failing with a 5xx over the last minute.'
+
+      - alert: HighLatencyP95
+        expr: gateway:http_request_duration_seconds:p95 > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'p95 latency above 500ms'
+          description: 'Current p95 is {{ $value | humanizeDuration }}, against a PRD target of <50ms on a cache hit.'
+
+      - alert: LowCacheHitRate
+        expr: gateway:cache_hit_ratio:ratio1m < 0.5 and sum(rate(gateway_cache_events_total[1m])) > 1
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: 'Cache hit rate below 50% under active traffic'
+          description: 'A demo-grade threshold, not a validated production SLO — real hit rate depends on how concentrated real traffic is on a handful of keys. Current: {{ $value | humanizePercentage }}.'
+
+      - alert: RedisTargetDown
+        expr: up{job="redis"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Redis exporter target unreachable'
+          description: 'Cache, both rate limiters, and stampede locks all depend on Redis — this is close to a full-outage signal, not a minor one.'

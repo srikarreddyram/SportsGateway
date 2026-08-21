@@ -1,0 +1,222 @@
+name: sportsgateway
+
+# Full stack. `docker compose up -d --build` is enough to run everything: the gateway
+# defaults to the bundled mock provider, so no third-party API key is required to see
+# the system work. Point UPSTREAM_BASE_URL/UPSTREAM_API_KEY at API-Sports for real data.
+
+x-gateway-env: &gateway-env
+  NODE_ENV: production
+  REDIS_URL: redis://redis:6379
+  MONGO_URL: mongodb://mongo:27017
+  UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-http://mock-upstream:8081}
+  UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+  UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-4000}
+  CACHE_ENABLED: ${CACHE_ENABLED:-true}
+  CACHE_TTL_SCORES_S: ${CACHE_TTL_SCORES_S:-10}
+  CACHE_TTL_FIXTURES_S: ${CACHE_TTL_FIXTURES_S:-300}
+  CACHE_TTL_PLAYERS_S: ${CACHE_TTL_PLAYERS_S:-3600}
+  CACHE_SWR_ENABLED: ${CACHE_SWR_ENABLED:-true}
+  CACHE_SWR_WINDOW_S: ${CACHE_SWR_WINDOW_S:-30}
+  RL_INBOUND_ENABLED: ${RL_INBOUND_ENABLED:-true}
+  RL_INBOUND_CAPACITY: ${RL_INBOUND_CAPACITY:-600}
+  RL_INBOUND_REFILL_PER_SEC: ${RL_INBOUND_REFILL_PER_SEC:-200}
+  RL_OUTBOUND_ENABLED: ${RL_OUTBOUND_ENABLED:-true}
+  RL_OUTBOUND_CAPACITY: ${RL_OUTBOUND_CAPACITY:-100}
+  RL_OUTBOUND_REFILL_PER_SEC: ${RL_OUTBOUND_REFILL_PER_SEC:-1.6}
+  BREAKER_ENABLED: ${BREAKER_ENABLED:-true}
+  BREAKER_ERROR_THRESHOLD_PCT: ${BREAKER_ERROR_THRESHOLD_PCT:-50}
+  BREAKER_RESET_TIMEOUT_MS: ${BREAKER_RESET_TIMEOUT_MS:-10000}
+  ANALYTICS_ENABLED: ${ANALYTICS_ENABLED:-true}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  CORS_ORIGIN: ${CORS_ORIGIN:-*}
+  # A real default rather than empty, so the demo stack's /admin/* cache-invalidation
+  # endpoints are protected out of the box instead of silently open because nobody set
+  # one. It is still a published, well-known value the moment this repo is public — set
+  # your own ADMIN_TOKEN for anything beyond a local demo.
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-sportsgateway-demo-admin-token-change-me}
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - '${GATEWAY_PORT:-8080}:80'
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      # Must be healthy, not merely started: Nginx resolves the `gateway` hostname when
+      # it loads its config and refuses to start if the name does not resolve yet.
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1, not localhost: inside the container localhost resolves to ::1 first
+      # and Nginx listens on IPv4 only, so the probe would be refused while the server
+      # is in fact serving traffic.
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1/nginx-health']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build: .
+    # No container_name and no host port: both would break `--scale gateway=N`.
+    command: ['node', 'src/index.js']
+    environment: *gateway-env
+    expose:
+      - '3000'
+    deploy:
+      replicas: ${GATEWAY_REPLICAS:-2}
+      resources:
+        limits:
+          # A per-replica CPU cap. Node is single-threaded, so a replica can never use
+          # more than one core anyway; pinning it makes capacity per instance explicit
+          # and reproducible. scripts/scaling.sh lowers this so that the gateway, rather
+          # than the load generator or the host's core count, is the binding constraint
+          # when measuring what an added replica is worth.
+          cpus: '${GATEWAY_CPUS:-2}'
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-upstream:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ['node', 'src/worker.js']
+    environment: *gateway-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # volatile-lru, not allkeys-lru: this Redis also backs BullMQ, whose job and lock
+    # keys carry no TTL and must never be evicted (evicting a lock corrupts queue state,
+    # which BullMQ warns about at startup). Every cache and rate-limit key is written
+    # with an expiry, so they stay evictable under memory pressure and job data does not.
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory', '512mb', '--maxmemory-policy', 'volatile-lru']
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0-alpine
+    command: ['--redis.addr=redis:6379']
+    ports:
+      - '${REDIS_EXPORTER_PORT:-9121}:9121'
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  mongo:
+    image: mongo:7
+    ports:
+      - '${MONGO_PORT:-27017}:27017'
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  mock-upstream:
+    build: ./mock-upstream
+    environment:
+      PORT: '8081'
+      MOCK_BASE_LATENCY_MS: ${MOCK_BASE_LATENCY_MS:-80}
+      MOCK_JITTER_MS: ${MOCK_JITTER_MS:-40}
+    ports:
+      # Exposed so benchmarks can read /__stats and inject failures via /__control.
+      - '${MOCK_PORT:-8081}:8081'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:8081/health']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - '${PROMETHEUS_PORT:-9090}:9090'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    depends_on:
+      - gateway
+      - redis-exporter
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - '${GRAFANA_PORT:-3001}:3000'
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  # Load generator. Not started by `up`; run explicitly:
+  #   docker compose run --rm k6 run /scripts/burst.js
+  k6:
+    image: grafana/k6:latest
+    profiles: ['tools']
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      MOCK_URL: ${K6_MOCK_URL:-http://mock-upstream:8081}
+      RESULTS_DIR: /results
+      # Exported shell variables do not reach a `compose run` container on their own;
+      # they have to be declared here or the scenario silently uses its own defaults.
+      VUS: ${VUS:-}
+      DURATION: ${DURATION:-}
+    depends_on:
+      - nginx
+
+volumes:
+  redis-data:
+  mongo-data:
+  prometheus-data:
+  grafana-data:

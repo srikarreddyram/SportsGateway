@@ -1,0 +1,452 @@
+openapi: 3.0.3
+info:
+  title: SportsGateway API
+  version: '1.0'
+  description: |
+    Distributed API gateway for sports data. Every route below is the same public
+    surface real clients use — this spec is generated from, and kept next to, the
+    endpoint definitions in `src/upstream/endpoints.js` and `src/routes/`, not written
+    from memory of what the API "should" look like.
+
+    **Response envelope.** Every `/api/*` route returns `{ meta, data }`. `meta.cache`
+    reports what actually happened on this request (`HIT`, `MISS`, `STALE`,
+    `FALLBACK`, `COALESCED`, or `BYPASS` when caching is disabled) — the same value is
+    also echoed as the `X-Cache` response header, so a header-only consumer doesn't need
+    to parse the body just to see it.
+
+    **Errors** are always `{ error: { code, message, details? } }` with a matching HTTP
+    status — never a bare 500 leaking upstream failure detail.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  contact:
+    name: SportsGateway
+    url: https://github.com/
+
+# Public by default: every sports-data route is unauthenticated read-only data. The
+# admin operations opt in to AdminToken individually. Declaring `security: []` at the
+# root states that intent explicitly rather than leaving it ambiguous.
+security: []
+
+servers:
+  - url: http://localhost:8080
+    description: Local stack via Nginx (docker compose up)
+  - url: http://localhost:3000
+    description: A single gateway instance directly (npm start)
+
+tags:
+  - name: Sports data
+    description: The gateway's actual product — cached, rate-limited, breaker-protected proxy routes.
+  - name: Operations
+    description: Liveness, readiness, and Prometheus metrics.
+  - name: Admin
+    description: Manual cache control for demos and debugging. Optionally protected by ADMIN_TOKEN.
+
+paths:
+  /api/scores/{matchId}:
+    get:
+      operationId: getMatchScore
+      tags: [Sports data]
+      summary: Live score and status for one match
+      description: |
+        TTL is volatility-aware: a finished match caches for hours
+        (`CACHE_TTL_FINISHED_S`), an in-play one for seconds (`CACHE_TTL_SCORES_S`).
+      parameters:
+        - $ref: '#/components/parameters/MatchId'
+      responses:
+        '200':
+          description: Match found
+          headers:
+            X-Cache: { $ref: '#/components/headers/XCache' }
+            X-Cache-TTL: { $ref: '#/components/headers/XCacheTTL' }
+            X-Degraded: { $ref: '#/components/headers/XDegraded' }
+            X-Instance: { $ref: '#/components/headers/XInstance' }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          match: { $ref: '#/components/schemas/Match' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/CircuitOpen' }
+
+  /api/fixtures/{date}:
+    get:
+      operationId: listFixturesByDate
+      tags: [Sports data]
+      summary: Every fixture on a given calendar date
+      parameters:
+        - $ref: '#/components/parameters/Date'
+      responses:
+        '200':
+          description: Fixtures for the date (possibly zero)
+          headers:
+            X-Cache: { $ref: '#/components/headers/XCache' }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          date: { type: string, format: date }
+                          count: { type: integer }
+                          matches:
+                            type: array
+                            items: { $ref: '#/components/schemas/Match' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/players/{playerId}:
+    get:
+      operationId: getPlayer
+      tags: [Sports data]
+      summary: A player's profile and per-team statistics
+      parameters:
+        - $ref: '#/components/parameters/PlayerId'
+        - name: season
+          in: query
+          required: false
+          description: Defaults to UPSTREAM_DEFAULT_SEASON. Part of the cache key, since a player's stats differ per season.
+          schema: { type: integer, minimum: 1990, maximum: 2100 }
+      responses:
+        '200':
+          description: Player found
+          headers:
+            X-Cache: { $ref: '#/components/headers/XCache' }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          player: { $ref: '#/components/schemas/Player' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /health:
+    get:
+      operationId: getLiveness
+      tags: [Operations]
+      summary: Liveness — is the process up at all
+      description: Nginx keeps routing to any instance that answers this. Never checks a dependency.
+      responses:
+        '200':
+          description: Process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  instance: { type: string }
+                  uptimeSeconds: { type: integer }
+
+  /ready:
+    get:
+      operationId: getReadiness
+      tags: [Operations]
+      summary: Readiness — can this instance actually serve traffic
+      description: Checks Redis. A tripped circuit breaker is reported but does NOT fail readiness — the instance still serves cached data, so pulling it from the pool would make things worse, not better.
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadyStatus' }
+        '503':
+          description: Redis unreachable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadyStatus' }
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      tags: [Operations]
+      summary: Prometheus exposition format
+      responses:
+        '200':
+          description: Metrics in Prometheus text format
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /admin/status:
+    get:
+      operationId: getAdminStatus
+      tags: [Admin]
+      summary: Live gateway state — breaker stats, cache mode, effective config
+      security: [{ AdminToken: [] }]
+      responses:
+        '200':
+          description: Current state
+          content:
+            application/json:
+              schema: { type: object }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/cache:
+    delete:
+      operationId: invalidateCache
+      tags: [Admin]
+      summary: Invalidate cached entries
+      security: [{ AdminToken: [] }]
+      parameters:
+        - name: route
+          in: query
+          required: false
+          description: Restrict to one route (scores, fixtures, players). Omit to wipe every SportsGateway cache key.
+          schema: { type: string, enum: [scores, fixtures, players] }
+      responses:
+        '200':
+          description: Keys removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invalidated: { type: integer }
+                  pattern: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/cache/{route}/{id}:
+    delete:
+      operationId: invalidateCacheEntry
+      tags: [Admin]
+      summary: Invalidate one specific cache entry
+      security: [{ AdminToken: [] }]
+      parameters:
+        - name: route
+          in: path
+          required: true
+          schema: { type: string, enum: [scores, fixtures, players] }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Entry removed (or was already absent)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invalidated: { type: boolean }
+                  key: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    AdminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: Only enforced when the gateway is started with ADMIN_TOKEN set.
+
+  parameters:
+    MatchId:
+      name: matchId
+      in: path
+      required: true
+      schema: { type: string, pattern: '^\d{1,12}$' }
+    PlayerId:
+      name: playerId
+      in: path
+      required: true
+      schema: { type: string, pattern: '^\d{1,12}$' }
+    Date:
+      name: date
+      in: path
+      required: true
+      schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: '2026-08-20' }
+
+  headers:
+    XCache:
+      description: What happened on this request — HIT, MISS, STALE, FALLBACK, COALESCED, or BYPASS.
+      schema: { type: string, enum: [HIT, MISS, STALE, FALLBACK, COALESCED, BYPASS] }
+    XCacheTTL:
+      description: Seconds the entry was stored for.
+      schema: { type: integer }
+    XDegraded:
+      description: Present and "true" only on a FALLBACK response — upstream was down and this is the last-known-good value.
+      schema: { type: string, enum: ['true'] }
+    XInstance:
+      description: Which gateway replica served this request. Never varies in shape across instances — that's the statelessness guarantee made visible.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed input (bad id format, bad date)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: Well-formed id, but the provider has no such record
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    RateLimited:
+      description: Client exceeded its inbound budget, or the shared upstream quota is exhausted
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    CircuitOpen:
+      description: Upstream is failing and no cached fallback was available
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: ADMIN_TOKEN is set and the request didn't present a matching X-Admin-Token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+
+  schemas:
+    Envelope:
+      type: object
+      properties:
+        meta:
+          type: object
+          properties:
+            cache: { type: string, enum: [HIT, MISS, STALE, FALLBACK, COALESCED, BYPASS] }
+            ageMs: { type: integer }
+            instance: { type: string }
+            requestId: { type: string, format: uuid }
+            degraded: { type: boolean }
+            note: { type: string }
+        data: { type: object }
+
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: not_found }
+            message: { type: string }
+            details: { type: object }
+
+    ReadyStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, degraded] }
+        instance: { type: string }
+        checks:
+          type: object
+          properties:
+            redis: { type: string, enum: [ok, unreachable] }
+            circuitBreaker: { type: string, enum: [closed, halfOpen, open] }
+
+    Team:
+      type: object
+      properties:
+        id: { type: integer, nullable: true }
+        name: { type: string, nullable: true }
+        logo: { type: string, nullable: true }
+        winner: { type: boolean, nullable: true }
+
+    Match:
+      type: object
+      properties:
+        matchId: { type: integer, nullable: true }
+        kickoff: { type: string, format: date-time, nullable: true }
+        timestamp: { type: integer, nullable: true }
+        status:
+          type: object
+          properties:
+            short: { type: string, nullable: true, example: 2H }
+            description: { type: string, nullable: true, example: Second Half }
+            elapsed: { type: integer, nullable: true }
+            live: { type: boolean }
+            finished: { type: boolean }
+        venue:
+          type: object
+          nullable: true
+          properties:
+            name: { type: string, nullable: true }
+            city: { type: string, nullable: true }
+        referee: { type: string, nullable: true }
+        league:
+          type: object
+          nullable: true
+          properties:
+            id: { type: integer, nullable: true }
+            name: { type: string, nullable: true }
+            country: { type: string, nullable: true }
+            season: { type: integer, nullable: true }
+            round: { type: string, nullable: true }
+        teams:
+          type: object
+          properties:
+            home: { $ref: '#/components/schemas/Team' }
+            away: { $ref: '#/components/schemas/Team' }
+        score:
+          type: object
+          properties:
+            current: { $ref: '#/components/schemas/Goals' }
+            halftime: { $ref: '#/components/schemas/Goals' }
+            fulltime: { $ref: '#/components/schemas/Goals' }
+            extratime: { $ref: '#/components/schemas/Goals' }
+            penalty: { $ref: '#/components/schemas/Goals' }
+
+    Goals:
+      type: object
+      properties:
+        home: { type: integer, nullable: true }
+        away: { type: integer, nullable: true }
+
+    Player:
+      type: object
+      properties:
+        playerId: { type: integer, nullable: true }
+        name: { type: string, nullable: true }
+        firstname: { type: string, nullable: true }
+        lastname: { type: string, nullable: true }
+        age: { type: integer, nullable: true }
+        nationality: { type: string, nullable: true }
+        height: { type: string, nullable: true }
+        weight: { type: string, nullable: true }
+        photo: { type: string, nullable: true }
+        statistics:
+          type: array
+          items:
+            type: object
+            properties:
+              team: { $ref: '#/components/schemas/Team' }
+              league:
+                type: object
+                nullable: true
+                properties:
+                  id: { type: integer, nullable: true }
+                  name: { type: string, nullable: true }
+                  season: { type: integer, nullable: true }
+              position: { type: string, nullable: true }
+              appearances: { type: integer, nullable: true }
+              minutes: { type: integer, nullable: true }
+              rating: { type: number, nullable: true }
+              goals: { type: integer }
+              assists: { type: integer }
+              yellowCards: { type: integer }
+              redCards: { type: integer }

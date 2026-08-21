@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes an in-flight run obsolete; cancel it rather than
+# paying for both. Never cancel on main, where each run is the record for that commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  backend:
+    name: Backend (lint, format, test)
+    runs-on: ubuntu-latest
+    services:
+      # The suite drives the real app against a real Redis rather than a fake, so CI has
+      # to provide one. The health options keep the job from starting before it answers.
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Test
+        run: npm test
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+
+      - name: Coverage
+        run: npm run test:coverage
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+
+  frontend:
+    name: Frontend (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  contract:
+    name: OpenAPI contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # A spec that has drifted into being invalid is worse than no spec, because
+      # clients generate from it. This fails the build rather than letting it rot.
+      - name: Validate openapi.yaml
+        run: npx --yes @redocly/cli@latest lint openapi.yaml --format stylish
+
+  docker:
+    name: Docker image + stack smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sportsgateway:ci .
+
+      # Building an image only proves it compiles. This proves the composed system
+      # actually serves traffic: bring the full stack up and exercise the real routes
+      # through Nginx, including the cache transition from MISS to HIT.
+      - name: Start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the gateway to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then
+              echo "gateway is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "gateway did not become healthy in time"; docker compose logs --tail 100; exit 1
+
+      - name: Smoke test the public routes
+        run: |
+          set -euo pipefail
+          curl -fsS http://localhost:8080/health > /dev/null
+          curl -fsS http://localhost:8080/openapi.json > /dev/null
+
+          first=$(curl -fsS -D - -o /dev/null http://localhost:8080/api/scores/215662 | grep -i '^x-cache:' | tr -d '\r' | awk '{print $2}')
+          second=$(curl -fsS -D - -o /dev/null http://localhost:8080/api/scores/215662 | grep -i '^x-cache:' | tr -d '\r' | awk '{print $2}')
+          echo "first=$first second=$second"
+          if [ "$second" != "HIT" ]; then
+            echo "expected the second request to be served from cache, got '$second'"; exit 1
+          fi
+
+      - name: Verify admin routes are protected but public routes are not
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/admin/status)
+          [ "$code" = "401" ] || { echo "admin/status should be 401 without a token, got $code"; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'x-admin-token: sportsgateway-demo-admin-token-change-me' http://localhost:8080/admin/status)
+          [ "$code" = "200" ] || { echo "admin/status should be 200 with the token, got $code"; exit 1; }
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Fails only on high/critical. Lower severities in transitive dev dependencies
+      # would otherwise block unrelated work without a matching real-world risk.
+      - name: Audit backend dependencies
+        run: npm audit --audit-level=high
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+        working-directory: web
